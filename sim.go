@@ -28,13 +28,26 @@ type PowerProfile struct {
 	SleepEnergyPerMillisecond  float64       `json:"sleepEnergyPerMillisecond"`
 	WakeDuration               time.Duration `json:"wakeDuration"`
 	WakeEnergyNanos            float64       `json:"wakeEnergyNanos"`
+	// SupplyEnergyPerMillisecond caps the total power draw; 0 means unlimited.
+	// When the instantaneous draw exceeds the cap, time stretches (brownout)
+	// so that energy is conserved and the extra elapsed time is accounted
+	// as WaitDuration.
+	SupplyEnergyPerMillisecond float64 `json:"supplyEnergyPerMillisecond,omitempty"`
+}
+
+type PowerDomain struct {
+	Name                     string  `json:"name"`
+	On                       bool    `json:"on"`
+	IdleEnergyPerMillisecond float64 `json:"idleEnergyPerMillisecond"`
 }
 
 type Peripheral struct {
-	Name                 string  `json:"name"`
-	EnergyPerMillisecond float64 `json:"energyPerMillisecond"`
-	On                   bool    `json:"on"`
-	TransferEnd          int64   `json:"transferEnd"`
+	Name                 string   `json:"name"`
+	EnergyPerMillisecond float64  `json:"energyPerMillisecond"`
+	On                   bool     `json:"on"`
+	TransferEnd          int64    `json:"transferEnd"`
+	Domain               string   `json:"domain,omitempty"`
+	DependsOn            []string `json:"dependsOn,omitempty"`
 }
 
 func (p *Peripheral) transferring(now time.Duration) bool {
@@ -61,22 +74,27 @@ type Record struct {
 }
 
 type Timeline struct {
-	Now              time.Duration          `json:"now"`
-	EnergyNanos      float64                `json:"energyNanos"`
-	CPUState         CPUState               `json:"cpuState"`
-	WakeAt           time.Duration          `json:"wakeAt"`
-	Profile          PowerProfile           `json:"profile"`
-	Peripherals      map[string]*Peripheral `json:"peripherals"`
-	Events           []Event                `json:"events"`
-	Records          []Record               `json:"records"`
-	ActiveDuration   time.Duration          `json:"activeDuration"`
-	SleepDuration    time.Duration          `json:"sleepDuration"`
-	WakeDuration     time.Duration          `json:"wakeDurationTotal"`
-	CPUWork          time.Duration          `json:"cpuWork"`
-	TransferDuration time.Duration          `json:"transferDuration"`
-	CompletedEvents  map[string]int         `json:"completedEvents"`
-	WakeReasons      []string               `json:"wakeReasons"`
-	RecoveryCount    int                    `json:"recoveryCount"`
+	Now                time.Duration           `json:"now"`
+	EnergyNanos        float64                 `json:"energyNanos"`
+	CPUState           CPUState                `json:"cpuState"`
+	WakeAt             time.Duration           `json:"wakeAt"`
+	Profile            PowerProfile            `json:"profile"`
+	Peripherals        map[string]*Peripheral  `json:"peripherals"`
+	Events             []Event                 `json:"events"`
+	Records            []Record                `json:"records"`
+	ActiveDuration     time.Duration           `json:"activeDuration"`
+	SleepDuration      time.Duration           `json:"sleepDuration"`
+	WakeDuration       time.Duration           `json:"wakeDurationTotal"`
+	CPUWork            time.Duration           `json:"cpuWork"`
+	TransferDuration   time.Duration           `json:"transferDuration"`
+	WaitDuration       time.Duration           `json:"waitDuration"`
+	CompletedEvents    map[string]int          `json:"completedEvents"`
+	WakeReasons        []string                `json:"wakeReasons"`
+	RecoveryCount      int                     `json:"recoveryCount"`
+	Domains            map[string]*PowerDomain `json:"domains,omitempty"`
+	WakeRemaining      time.Duration           `json:"wakeRemaining,omitempty"`
+	WakeStartAt        time.Duration           `json:"wakeStartAt,omitempty"`
+	WakePendingReasons []string                `json:"wakePendingReasons,omitempty"`
 }
 
 func NewTimeline(profile PowerProfile) *Timeline {
@@ -84,12 +102,37 @@ func NewTimeline(profile PowerProfile) *Timeline {
 		CPUState:        CPUActive,
 		Profile:         profile,
 		Peripherals:     make(map[string]*Peripheral),
+		Domains:         make(map[string]*PowerDomain),
 		CompletedEvents: make(map[string]int),
 	}
 }
 
+func (t *Timeline) AddDomain(name string, idleEnergyPerMillisecond float64) {
+	t.Domains[name] = &PowerDomain{Name: name, On: true, IdleEnergyPerMillisecond: idleEnergyPerMillisecond}
+}
+
 func (t *Timeline) AddPeripheral(name string, energyPerMillisecond float64) {
 	t.Peripherals[name] = &Peripheral{Name: name, EnergyPerMillisecond: energyPerMillisecond}
+}
+
+func (t *Timeline) AddPeripheralToDomain(name, domain string, energyPerMillisecond float64, dependsOn ...string) error {
+	if domain != "" {
+		if t.Domains[domain] == nil {
+			return fmt.Errorf("unknown power domain %q", domain)
+		}
+	}
+	for _, dep := range dependsOn {
+		if t.Peripherals[dep] == nil {
+			return fmt.Errorf("unknown dependency peripheral %q", dep)
+		}
+	}
+	t.Peripherals[name] = &Peripheral{
+		Name:                 name,
+		EnergyPerMillisecond: energyPerMillisecond,
+		Domain:               domain,
+		DependsOn:            dependsOn,
+	}
+	return nil
 }
 
 func (t *Timeline) BeginTransfer(name string, duration time.Duration) error {
@@ -124,19 +167,45 @@ func (t *Timeline) SleepUntil(wakeAt time.Duration, peripherals ...string) error
 	if wakeAt < t.Now {
 		return fmt.Errorf("wake time %s is before current time %s", wakeAt, t.Now)
 	}
+	shutdown := map[string]bool{}
+	domainsOff := map[string]bool{}
 	for _, name := range peripherals {
+		if domain, ok := t.Domains[name]; ok {
+			domainsOff[domain.Name] = true
+			for _, peripheral := range t.Peripherals {
+				if peripheral.Domain == name {
+					shutdown[peripheral.Name] = true
+				}
+			}
+			continue
+		}
 		peripheral := t.Peripherals[name]
 		if peripheral == nil {
-			return fmt.Errorf("unknown peripheral %q", name)
+			return fmt.Errorf("unknown peripheral or domain %q", name)
 		}
-		if peripheral.transferring(t.Now) {
-			return fmt.Errorf("cannot power off %q: transfer finishes at %s", name, time.Duration(peripheral.TransferEnd))
+		shutdown[name] = true
+	}
+	for _, peripheral := range t.Peripherals {
+		if !peripheral.transferring(t.Now) {
+			continue
+		}
+		if shutdown[peripheral.Name] {
+			return fmt.Errorf("cannot power off %q: transfer finishes at %s", peripheral.Name, time.Duration(peripheral.TransferEnd))
+		}
+		for _, dep := range peripheral.DependsOn {
+			if shutdown[dep] {
+				return fmt.Errorf("cannot power off %q: %q depends on it and transfers until %s",
+					dep, peripheral.Name, time.Duration(peripheral.TransferEnd))
+			}
 		}
 	}
-	for _, name := range peripherals {
+	for name := range shutdown {
 		peripheral := t.Peripherals[name]
 		peripheral.On = false
 		peripheral.TransferEnd = 0
+	}
+	for name := range domainsOff {
+		t.Domains[name].On = false
 	}
 	t.CPUState = CPUSleep
 	t.WakeAt = wakeAt
@@ -148,7 +217,19 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 	sort.SliceStable(t.Events, func(i, j int) bool { return t.Events[i].At < t.Events[j].At })
 
 	for t.Now < horizon {
-		if t.CPUState == CPUSleep {
+		switch t.CPUState {
+		case CPUWaking:
+			step := t.WakeRemaining
+			if remaining := horizon - t.Now; remaining < step {
+				step = remaining
+			}
+			t.advance(step)
+			t.WakeRemaining -= step
+			if t.WakeRemaining == 0 {
+				t.finishWake()
+			}
+			continue
+		case CPUSleep:
 			nextEventAt, hasEvent := t.nextEventAt()
 			target := t.WakeAt
 			if hasEvent && nextEventAt < target {
@@ -159,13 +240,11 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 			}
 			t.advance(target - t.Now)
 			if t.CPUState == CPUSleep && (t.Now >= t.WakeAt || t.firstDueEvent() >= 0) {
-				if err := t.recover(); err != nil {
+				if err := t.beginWake(); err != nil {
 					return err
 				}
 			}
-			if t.Now >= horizon {
-				return nil
-			}
+			continue
 		}
 
 		if t.CPUState != CPUActive {
@@ -208,7 +287,7 @@ func (t *Timeline) firstDueEvent() int {
 	return -1
 }
 
-func (t *Timeline) recover() error {
+func (t *Timeline) beginWake() error {
 	due := t.dueEvents()
 	reasons := make([]string, 0, len(due))
 	for _, event := range due {
@@ -219,22 +298,26 @@ func (t *Timeline) recover() error {
 	}
 
 	t.CPUState = CPUWaking
-	wakeDuration := t.Profile.WakeDuration
-	before := t.EnergyNanos
-	t.advance(wakeDuration)
-	t.EnergyNanos += t.Profile.WakeEnergyNanos
-	t.WakeDuration += wakeDuration
+	t.WakeRemaining = t.Profile.WakeDuration
+	t.WakeStartAt = t.Now
+	t.WakePendingReasons = reasons
 	t.RecoveryCount++
 	t.WakeReasons = append(t.WakeReasons, reasons...)
-	t.Records = append(t.Records, Record{
-		At:          t.Now - wakeDuration,
-		Kind:        "wake",
-		Reasons:     reasons,
-		Duration:    wakeDuration,
-		EnergyNanos: t.EnergyNanos - before,
-	})
-	t.CPUState = CPUActive
 	return nil
+}
+
+func (t *Timeline) finishWake() {
+	wakeDuration := t.Profile.WakeDuration
+	t.EnergyNanos += t.Profile.WakeEnergyNanos
+	t.Records = append(t.Records, Record{
+		At:          t.WakeStartAt,
+		Kind:        "wake",
+		Reasons:     t.WakePendingReasons,
+		Duration:    wakeDuration,
+		EnergyNanos: t.Profile.WakeEnergyNanos,
+	})
+	t.WakePendingReasons = nil
+	t.CPUState = CPUActive
 }
 
 func (t *Timeline) dueEvents() []Event {
@@ -277,7 +360,7 @@ func (t *Timeline) processDueEvents() error {
 			if peripheral == nil {
 				return fmt.Errorf("event %q uses unknown peripheral %q", event.Reason, event.Peripheral)
 			}
-			peripheral.On = true
+			t.powerOnWithDependencies(event.Peripheral)
 			if event.TransferDuration > 0 {
 				peripheral.TransferEnd = int64(start + event.TransferDuration)
 			}
@@ -320,6 +403,22 @@ func (t *Timeline) processDueEvents() error {
 	return nil
 }
 
+func (t *Timeline) powerOnWithDependencies(name string) {
+	peripheral := t.Peripherals[name]
+	if peripheral == nil {
+		return
+	}
+	if peripheral.Domain != "" {
+		if domain := t.Domains[peripheral.Domain]; domain != nil {
+			domain.On = true
+		}
+	}
+	peripheral.On = true
+	for _, dep := range peripheral.DependsOn {
+		t.powerOnWithDependencies(dep)
+	}
+}
+
 func (t *Timeline) advance(duration time.Duration) {
 	if duration <= 0 {
 		return
@@ -333,6 +432,8 @@ func (t *Timeline) advance(duration time.Duration) {
 	case CPUSleep:
 		cpuEnergyPerMillisecond = t.Profile.SleepEnergyPerMillisecond
 		t.SleepDuration += duration
+	case CPUWaking:
+		t.WakeDuration += duration
 	}
 
 	peripheralEnergy := 0.0
@@ -342,9 +443,26 @@ func (t *Timeline) advance(duration time.Duration) {
 		}
 		peripheralEnergy += peripheral.EnergyPerMillisecond * float64(duration) / float64(time.Millisecond)
 	}
+	for _, domain := range t.Domains {
+		if !domain.On {
+			continue
+		}
+		peripheralEnergy += domain.IdleEnergyPerMillisecond * float64(duration) / float64(time.Millisecond)
+	}
+
+	energy := cpuEnergyPerMillisecond*float64(duration)/float64(time.Millisecond) + peripheralEnergy
+	if supply := t.Profile.SupplyEnergyPerMillisecond; supply > 0 {
+		rate := energy * float64(time.Millisecond) / float64(duration)
+		if rate > supply {
+			stretched := time.Duration(float64(duration) * rate / supply)
+			t.WaitDuration += stretched - duration
+			energy = supply * float64(stretched) / float64(time.Millisecond)
+			duration = stretched
+		}
+	}
 
 	t.Now += duration
-	t.EnergyNanos += cpuEnergyPerMillisecond*float64(duration)/float64(time.Millisecond) + peripheralEnergy
+	t.EnergyNanos += energy
 }
 
 func (t *Timeline) SaveSnapshot() ([]byte, error) {
@@ -358,6 +476,9 @@ func LoadSnapshot(data []byte) (*Timeline, error) {
 	}
 	if timeline.Peripherals == nil {
 		timeline.Peripherals = make(map[string]*Peripheral)
+	}
+	if timeline.Domains == nil {
+		timeline.Domains = make(map[string]*PowerDomain)
 	}
 	if timeline.CompletedEvents == nil {
 		timeline.CompletedEvents = make(map[string]int)
