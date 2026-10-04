@@ -23,6 +23,49 @@ func main() {
 		domains.EnergyNanos/1000,
 	)
 	fmt.Printf("[domains] recoveries=%d reasons=%v\n", domains.RecoveryCount, domains.WakeReasons)
+
+	deadlines := buildDeadlineScenario()
+	fmt.Printf("[deadlines] time=%s on-time=%v missed=%v energy=%.3fuJ\n",
+		deadlines.Now,
+		deadlines.CompletedOnTime,
+		deadlines.MissedDeadlines,
+		deadlines.EnergyNanos/1000,
+	)
+}
+
+// buildDeadlineScenario 演示休眠进入过程与带截止时间的工作请求：
+// 进入休眠耗时 2ms，途中 9ms 到来的紧急工作打断进入（已耗能不退回），
+// 两个截止时间重叠的请求合并处理，loose 赶上、 tight 错过。
+func buildDeadlineScenario() *Timeline {
+	timeline := NewTimeline(PowerProfile{
+		ActiveEnergyPerMillisecond: 2_000,
+		SleepEnergyPerMillisecond:  100,
+		WakeDuration:               2 * time.Millisecond,
+		WakeEnergyNanos:            12_000,
+		SleepEntryDuration:         2 * time.Millisecond,
+		SleepEntryEnergyNanos:      6_000,
+	})
+	timeline.AddPeripheral("sensor", 1_500)
+	timeline.AddPeripheral("radio", 4_000)
+
+	events := []Event{
+		{At: 9 * time.Millisecond, Type: EventBurst, Reason: "urgent-burst", Peripheral: "radio", CPUWork: time.Millisecond, TransferDuration: 2 * time.Millisecond, Urgent: true, PowerOff: true},
+		{At: 20 * time.Millisecond, Type: EventSample, Reason: "loose", Peripheral: "sensor", CPUWork: 3 * time.Millisecond, Deadline: 30 * time.Millisecond, PowerOff: true},
+		{At: 20 * time.Millisecond, Type: EventBurst, Reason: "tight", Peripheral: "radio", CPUWork: 3 * time.Millisecond, Deadline: 22 * time.Millisecond, PowerOff: true},
+	}
+	for _, event := range events {
+		if err := timeline.Schedule(event); err != nil {
+			panic(err)
+		}
+	}
+
+	if err := timeline.SleepUntil(50*time.Millisecond, "sensor", "radio"); err != nil {
+		panic(err)
+	}
+	if err := timeline.RunUntil(40 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	return timeline
 }
 
 func buildScenario() *Timeline {

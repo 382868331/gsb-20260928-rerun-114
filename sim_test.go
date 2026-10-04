@@ -246,3 +246,246 @@ func TestInsufficientSupplyStretchesTime(t *testing.T) {
 		t.Fatalf("active work = %s", timeline.ActiveDuration)
 	}
 }
+
+func sleepEntryTimeline() *Timeline {
+	timeline := NewTimeline(PowerProfile{
+		ActiveEnergyPerMillisecond: 2_000,
+		SleepEnergyPerMillisecond:  100,
+		WakeDuration:               2 * time.Millisecond,
+		WakeEnergyNanos:            12_000,
+		SleepEntryDuration:         2 * time.Millisecond,
+		SleepEntryEnergyNanos:      6_000,
+	})
+	timeline.AddPeripheral("sensor", 1_500)
+	return timeline
+}
+
+func TestSnapshotDuringSleepEntryResumes(t *testing.T) {
+	run := func(restore bool) *Timeline {
+		timeline := sleepEntryTimeline()
+		if err := timeline.Schedule(Event{At: 25 * time.Millisecond, Type: EventSample, Reason: "periodic-sample", Peripheral: "sensor", CPUWork: 2 * time.Millisecond, TransferDuration: 3 * time.Millisecond, PowerOff: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := timeline.SleepUntil(30*time.Millisecond, "sensor"); err != nil {
+			t.Fatal(err)
+		}
+		// 1ms 时正处于 2ms 的休眠进入途中。
+		if err := timeline.RunUntil(1 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if restore {
+			if timeline.CPUState != CPUSleeping {
+				t.Fatalf("state = %s, want sleeping", timeline.CPUState)
+			}
+			data, err := timeline.SaveSnapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			timeline, err = LoadSnapshot(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if timeline.CPUState != CPUSleeping || timeline.SleepRemaining != time.Millisecond {
+				t.Fatalf("restored state=%s remaining=%s", timeline.CPUState, timeline.SleepRemaining)
+			}
+		}
+		if err := timeline.RunUntil(40 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		return timeline
+	}
+	direct := run(false)
+	restored := run(true)
+	if restored.Now != direct.Now || restored.EnergyNanos != direct.EnergyNanos {
+		t.Fatalf("restored=%s/%.1f direct=%s/%.1f", restored.Now, restored.EnergyNanos, direct.Now, direct.EnergyNanos)
+	}
+	if restored.SleepEntryDuration != 2*time.Millisecond {
+		t.Fatalf("sleep entry = %s", restored.SleepEntryDuration)
+	}
+	// 待处理事件在重开后继续：25ms 的采样在恢复后照常完成。
+	if restored.CompletedEvents[string(EventSample)] != 1 || restored.CPUWork != 2*time.Millisecond {
+		t.Fatalf("completed=%v cpu-work=%s", restored.CompletedEvents, restored.CPUWork)
+	}
+	if restored.Peripherals["sensor"].On {
+		t.Fatal("sensor should be off after the sleep entry completes")
+	}
+}
+
+func TestUrgentEventInterruptsSleepEntry(t *testing.T) {
+	timeline := sleepEntryTimeline()
+	timeline.AddDomain("analog", 200)
+	timeline.AddDomain("rf", 300)
+	timeline.AddDomain("io", 100)
+	if err := timeline.AddPeripheralToDomain("adc", "analog", 1_500); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.AddPeripheralToDomain("radio", "rf", 4_000, "adc"); err != nil {
+		t.Fatal(err)
+	}
+	// 先完成一次休眠进入，让 io 域真正关闭。
+	if err := timeline.SleepUntil(6*time.Millisecond, "io"); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(8 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if timeline.Domains["io"].On {
+		t.Fatal("io domain should be off after the first sleep entry")
+	}
+	// 第二次进入休眠，途中 9ms 到来紧急工作。
+	if err := timeline.Schedule(Event{At: 9 * time.Millisecond, Type: EventBurst, Reason: "urgent-burst", Peripheral: "radio", CPUWork: time.Millisecond, TransferDuration: 2 * time.Millisecond, Urgent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.SleepUntil(30*time.Millisecond, "analog", "rf", "io"); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	aborted := false
+	for _, record := range timeline.Records {
+		if record.Kind == "sleep-entry-aborted" {
+			aborted = true
+		}
+	}
+	if !aborted {
+		t.Fatal("urgent event did not interrupt the sleep entry")
+	}
+	if timeline.CompletedEvents[string(EventBurst)] != 1 {
+		t.Fatalf("urgent event not processed: %v", timeline.CompletedEvents)
+	}
+	// 已经消耗的能量不退回：进入过程占了 1ms 活跃能耗。
+	if timeline.SleepEntryDuration != 3*time.Millisecond {
+		t.Fatalf("sleep entry total = %s", timeline.SleepEntryDuration)
+	}
+	// 独立域不应被无条件唤醒：io 与本次工作无关，保持关闭。
+	if timeline.Domains["io"].On {
+		t.Fatal("unrelated io domain must stay off")
+	}
+	if !timeline.Domains["analog"].On || !timeline.Domains["rf"].On {
+		t.Fatal("urgent work must power its own dependency chain")
+	}
+}
+
+func TestOverlappingDeadlinesAccounting(t *testing.T) {
+	timeline := testTimeline()
+	events := []Event{
+		{At: 10 * time.Millisecond, Type: EventSample, Reason: "loose", Peripheral: "sensor", CPUWork: 3 * time.Millisecond, Deadline: 20 * time.Millisecond},
+		{At: 10 * time.Millisecond, Type: EventBurst, Reason: "tight", Peripheral: "radio", CPUWork: 3 * time.Millisecond, Deadline: 12 * time.Millisecond},
+	}
+	for _, event := range events {
+		if err := timeline.Schedule(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := timeline.RunUntil(30 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// 两个请求合并处理，6ms 后到 16ms 完成：loose 赶上 20ms，tight 错过 12ms。
+	if len(timeline.CompletedOnTime) != 1 || timeline.CompletedOnTime[0] != "loose" {
+		t.Fatalf("on-time = %v", timeline.CompletedOnTime)
+	}
+	if len(timeline.MissedDeadlines) != 1 || timeline.MissedDeadlines[0] != "tight" {
+		t.Fatalf("missed = %v", timeline.MissedDeadlines)
+	}
+}
+
+func TestEarlyWakeMeetsDeadline(t *testing.T) {
+	timeline := testTimeline()
+	if err := timeline.Schedule(Event{At: 10 * time.Millisecond, Type: EventSample, Reason: "deadline-work", Peripheral: "sensor", CPUWork: 2 * time.Millisecond, Deadline: 12 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.SleepUntil(100 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// 提前 2ms 唤醒，10ms 事件到达时已活跃，12ms 正好赶上截止时间。
+	if len(timeline.MissedDeadlines) != 0 {
+		t.Fatalf("missed = %v", timeline.MissedDeadlines)
+	}
+	if len(timeline.CompletedOnTime) != 1 || timeline.CompletedOnTime[0] != "deadline-work" {
+		t.Fatalf("on-time = %v", timeline.CompletedOnTime)
+	}
+	if timeline.WakeReasons[0] != "deadline-work" {
+		t.Fatalf("wake reasons = %v", timeline.WakeReasons)
+	}
+}
+
+func TestSupplyRecoveryTimeline(t *testing.T) {
+	timeline := NewTimeline(PowerProfile{
+		ActiveEnergyPerMillisecond: 2_000,
+		SleepEnergyPerMillisecond:  100,
+		SupplyEnergyPerMillisecond: 1_000,
+		SupplyRecoveryAt:           10 * time.Millisecond,
+	})
+	// 恢复前：5ms 活跃工作被 1000nJ/ms 的供给拉长到 10ms。
+	if err := timeline.RunUntil(5 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if timeline.Now != 10*time.Millisecond || timeline.WaitDuration != 5*time.Millisecond {
+		t.Fatalf("time=%s wait=%s", timeline.Now, timeline.WaitDuration)
+	}
+	// 恢复后供给不限：2ms 工作不再拉长。
+	if err := timeline.RunUntil(12 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if timeline.Now != 12*time.Millisecond || timeline.WaitDuration != 5*time.Millisecond {
+		t.Fatalf("time=%s wait=%s", timeline.Now, timeline.WaitDuration)
+	}
+	// 能量账目：1000nJ/ms x 10ms + 2000nJ/ms x 2ms。
+	if math.Abs(timeline.EnergyNanos-14_000) > 0.001 {
+		t.Fatalf("energy = %.3f nJ, want 14000 nJ", timeline.EnergyNanos)
+	}
+}
+
+func TestContinuousAndResumedRunsAgree(t *testing.T) {
+	build := func() *Timeline {
+		timeline := sleepEntryTimeline()
+		events := []Event{
+			{At: 12 * time.Millisecond, Type: EventSample, Reason: "on-time", Peripheral: "sensor", CPUWork: 2 * time.Millisecond, Deadline: 18 * time.Millisecond},
+			{At: 12 * time.Millisecond, Type: EventBurst, Reason: "late", Peripheral: "sensor", CPUWork: 3 * time.Millisecond, Deadline: 13 * time.Millisecond},
+		}
+		for _, event := range events {
+			if err := timeline.Schedule(event); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := timeline.SleepUntil(50*time.Millisecond, "sensor"); err != nil {
+			t.Fatal(err)
+		}
+		return timeline
+	}
+	direct := build()
+	if err := direct.RunUntil(30 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// 在休眠进入途中保存，恢复后继续推进。
+	resumed := build()
+	if err := resumed.RunUntil(1 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	data, err := resumed.SaveSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err = LoadSnapshot(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resumed.RunUntil(30 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Now != direct.Now || resumed.EnergyNanos != direct.EnergyNanos {
+		t.Fatalf("resumed=%s/%.1f direct=%s/%.1f", resumed.Now, resumed.EnergyNanos, direct.Now, direct.EnergyNanos)
+	}
+	if len(resumed.CompletedOnTime) != len(direct.CompletedOnTime) || len(resumed.MissedDeadlines) != len(direct.MissedDeadlines) {
+		t.Fatalf("resumed on-time=%v missed=%v; direct on-time=%v missed=%v",
+			resumed.CompletedOnTime, resumed.MissedDeadlines, direct.CompletedOnTime, direct.MissedDeadlines)
+	}
+	if len(direct.CompletedOnTime) != 1 || direct.CompletedOnTime[0] != "on-time" ||
+		len(direct.MissedDeadlines) != 1 || direct.MissedDeadlines[0] != "late" {
+		t.Fatalf("on-time=%v missed=%v", direct.CompletedOnTime, direct.MissedDeadlines)
+	}
+}

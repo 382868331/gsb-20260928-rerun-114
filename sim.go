@@ -14,6 +14,10 @@ const (
 	CPUActive CPUState = "active"
 	CPUSleep  CPUState = "sleep"
 	CPUWaking CPUState = "waking"
+	// CPUSleeping is the sleep-entry transition: the processor is still
+	// powered while peripherals finish draining, and a snapshot taken here
+	// resumes the entry instead of jumping straight to sleep.
+	CPUSleeping CPUState = "sleeping"
 )
 
 type EventType string
@@ -33,6 +37,16 @@ type PowerProfile struct {
 	// so that energy is conserved and the extra elapsed time is accounted
 	// as WaitDuration.
 	SupplyEnergyPerMillisecond float64 `json:"supplyEnergyPerMillisecond,omitempty"`
+	// SupplyRecoveryAt is when a constrained supply recovers; before it the
+	// SupplyEnergyPerMillisecond cap applies, at and after it the
+	// RecoveredSupplyEnergyPerMillisecond cap applies (0 means unlimited).
+	SupplyRecoveryAt                    time.Duration `json:"supplyRecoveryAt,omitempty"`
+	RecoveredSupplyEnergyPerMillisecond float64       `json:"recoveredSupplyEnergyPerMillisecond,omitempty"`
+	// SleepEntryDuration models a non-instantaneous transition into sleep.
+	// SleepEntryEnergyNanos is charged once the entry completes; an aborted
+	// entry keeps the energy already spent but skips this charge.
+	SleepEntryDuration    time.Duration `json:"sleepEntryDuration,omitempty"`
+	SleepEntryEnergyNanos float64       `json:"sleepEntryEnergyNanos,omitempty"`
 }
 
 type PowerDomain struct {
@@ -62,6 +76,10 @@ type Event struct {
 	CPUWork          time.Duration `json:"cpuWork"`
 	TransferDuration time.Duration `json:"transferDuration,omitempty"`
 	PowerOff         bool          `json:"powerOff,omitempty"`
+	// Deadline, when > 0, is the latest completion time for the request.
+	Deadline time.Duration `json:"deadline,omitempty"`
+	// Urgent work interrupts an in-progress sleep entry.
+	Urgent bool `json:"urgent,omitempty"`
 }
 
 type Record struct {
@@ -74,27 +92,35 @@ type Record struct {
 }
 
 type Timeline struct {
-	Now                time.Duration           `json:"now"`
-	EnergyNanos        float64                 `json:"energyNanos"`
-	CPUState           CPUState                `json:"cpuState"`
-	WakeAt             time.Duration           `json:"wakeAt"`
-	Profile            PowerProfile            `json:"profile"`
-	Peripherals        map[string]*Peripheral  `json:"peripherals"`
-	Events             []Event                 `json:"events"`
-	Records            []Record                `json:"records"`
-	ActiveDuration     time.Duration           `json:"activeDuration"`
-	SleepDuration      time.Duration           `json:"sleepDuration"`
-	WakeDuration       time.Duration           `json:"wakeDurationTotal"`
-	CPUWork            time.Duration           `json:"cpuWork"`
-	TransferDuration   time.Duration           `json:"transferDuration"`
-	WaitDuration       time.Duration           `json:"waitDuration"`
-	CompletedEvents    map[string]int          `json:"completedEvents"`
-	WakeReasons        []string                `json:"wakeReasons"`
-	RecoveryCount      int                     `json:"recoveryCount"`
-	Domains            map[string]*PowerDomain `json:"domains,omitempty"`
-	WakeRemaining      time.Duration           `json:"wakeRemaining,omitempty"`
-	WakeStartAt        time.Duration           `json:"wakeStartAt,omitempty"`
-	WakePendingReasons []string                `json:"wakePendingReasons,omitempty"`
+	Now                 time.Duration           `json:"now"`
+	EnergyNanos         float64                 `json:"energyNanos"`
+	CPUState            CPUState                `json:"cpuState"`
+	WakeAt              time.Duration           `json:"wakeAt"`
+	Profile             PowerProfile            `json:"profile"`
+	Peripherals         map[string]*Peripheral  `json:"peripherals"`
+	Events              []Event                 `json:"events"`
+	Records             []Record                `json:"records"`
+	ActiveDuration      time.Duration           `json:"activeDuration"`
+	SleepDuration       time.Duration           `json:"sleepDuration"`
+	WakeDuration        time.Duration           `json:"wakeDurationTotal"`
+	CPUWork             time.Duration           `json:"cpuWork"`
+	TransferDuration    time.Duration           `json:"transferDuration"`
+	WaitDuration        time.Duration           `json:"waitDuration"`
+	CompletedEvents     map[string]int          `json:"completedEvents"`
+	WakeReasons         []string                `json:"wakeReasons"`
+	RecoveryCount       int                     `json:"recoveryCount"`
+	Domains             map[string]*PowerDomain `json:"domains,omitempty"`
+	WakeRemaining       time.Duration           `json:"wakeRemaining,omitempty"`
+	WakeStartAt         time.Duration           `json:"wakeStartAt,omitempty"`
+	WakePendingReasons  []string                `json:"wakePendingReasons,omitempty"`
+	SleepRemaining      time.Duration           `json:"sleepRemaining,omitempty"`
+	SleepStartAt        time.Duration           `json:"sleepStartAt,omitempty"`
+	SleepPendingWakeAt  time.Duration           `json:"sleepPendingWakeAt,omitempty"`
+	SleepPendingOff     []string                `json:"sleepPendingOff,omitempty"`
+	SleepPendingDomains []string                `json:"sleepPendingDomains,omitempty"`
+	SleepEntryDuration  time.Duration           `json:"sleepEntryDurationTotal,omitempty"`
+	CompletedOnTime     []string                `json:"completedOnTime,omitempty"`
+	MissedDeadlines     []string                `json:"missedDeadlines,omitempty"`
 }
 
 func NewTimeline(profile PowerProfile) *Timeline {
@@ -199,6 +225,33 @@ func (t *Timeline) SleepUntil(wakeAt time.Duration, peripherals ...string) error
 			}
 		}
 	}
+	if t.Profile.SleepEntryDuration > 0 {
+		// Non-instantaneous entry: keep everything powered, remember the
+		// pending shutdown, and let RunUntil advance the transition.
+		names := make([]string, 0, len(shutdown))
+		for name := range shutdown {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		domains := make([]string, 0, len(domainsOff))
+		for name := range domainsOff {
+			domains = append(domains, name)
+		}
+		sort.Strings(domains)
+		t.CPUState = CPUSleeping
+		t.SleepRemaining = t.Profile.SleepEntryDuration
+		t.SleepStartAt = t.Now
+		t.SleepPendingWakeAt = wakeAt
+		t.SleepPendingOff = names
+		t.SleepPendingDomains = domains
+		return nil
+	}
+	t.powerOffAll(shutdown, domainsOff)
+	t.enterSleep(wakeAt)
+	return nil
+}
+
+func (t *Timeline) powerOffAll(shutdown map[string]bool, domainsOff map[string]bool) {
 	for name := range shutdown {
 		peripheral := t.Peripherals[name]
 		peripheral.On = false
@@ -207,10 +260,51 @@ func (t *Timeline) SleepUntil(wakeAt time.Duration, peripherals ...string) error
 	for name := range domainsOff {
 		t.Domains[name].On = false
 	}
+}
+
+func (t *Timeline) enterSleep(wakeAt time.Duration) {
 	t.CPUState = CPUSleep
 	t.WakeAt = wakeAt
 	t.Records = append(t.Records, Record{At: t.Now, Kind: "sleep", Duration: wakeAt - t.Now})
-	return nil
+}
+
+// finishSleepEntry applies the pending shutdown and charges the entry cost.
+func (t *Timeline) finishSleepEntry() {
+	shutdown := map[string]bool{}
+	for _, name := range t.SleepPendingOff {
+		shutdown[name] = true
+	}
+	domainsOff := map[string]bool{}
+	for _, name := range t.SleepPendingDomains {
+		domainsOff[name] = true
+	}
+	t.powerOffAll(shutdown, domainsOff)
+	t.EnergyNanos += t.Profile.SleepEntryEnergyNanos
+	t.Records = append(t.Records, Record{
+		At:          t.SleepStartAt,
+		Kind:        "sleep-entry",
+		Duration:    t.Profile.SleepEntryDuration,
+		EnergyNanos: t.Profile.SleepEntryEnergyNanos,
+	})
+	t.SleepPendingOff = nil
+	t.SleepPendingDomains = nil
+	t.enterSleep(t.SleepPendingWakeAt)
+}
+
+// abortSleepEntry cancels an in-progress entry for urgent work. Energy
+// already spent is not refunded and the pending shutdown is discarded;
+// domains that were already off stay off.
+func (t *Timeline) abortSleepEntry() {
+	t.Records = append(t.Records, Record{
+		At:       t.Now,
+		Kind:     "sleep-entry-aborted",
+		Duration: t.Now - t.SleepStartAt,
+		Detail:   "urgent work interrupted the sleep entry",
+	})
+	t.SleepRemaining = 0
+	t.SleepPendingOff = nil
+	t.SleepPendingDomains = nil
+	t.CPUState = CPUActive
 }
 
 func (t *Timeline) RunUntil(horizon time.Duration) error {
@@ -229,17 +323,35 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 				t.finishWake()
 			}
 			continue
-		case CPUSleep:
-			nextEventAt, hasEvent := t.nextEventAt()
-			target := t.WakeAt
-			if hasEvent && nextEventAt < target {
-				target = nextEventAt
+		case CPUSleeping:
+			if t.hasDueUrgentEvent() {
+				t.abortSleepEntry()
+				if err := t.beginWake(); err != nil {
+					return err
+				}
+				continue
 			}
+			step := t.SleepRemaining
+			if remaining := horizon - t.Now; remaining < step {
+				step = remaining
+			}
+			// Stop at the next event so urgent work can interrupt the entry.
+			if nextEventAt, hasEvent := t.nextEventAt(); hasEvent && nextEventAt > t.Now && nextEventAt-t.Now < step {
+				step = nextEventAt - t.Now
+			}
+			t.advance(step)
+			t.SleepRemaining -= step
+			if t.SleepRemaining == 0 {
+				t.finishSleepEntry()
+			}
+			continue
+		case CPUSleep:
+			target := t.sleepWakeTarget()
 			if target > horizon {
 				target = horizon
 			}
 			t.advance(target - t.Now)
-			if t.CPUState == CPUSleep && (t.Now >= t.WakeAt || t.firstDueEvent() >= 0) {
+			if t.CPUState == CPUSleep && t.Now >= t.sleepWakeTarget() {
 				if err := t.beginWake(); err != nil {
 					return err
 				}
@@ -271,6 +383,36 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 	return nil
 }
 
+// sleepWakeTarget is when the processor should start waking: the scheduled
+// wake time, or the next event — moved earlier by the wake latency for
+// deadline work so processing can start when the event arrives.
+func (t *Timeline) sleepWakeTarget() time.Duration {
+	target := t.WakeAt
+	if len(t.Events) > 0 {
+		event := t.Events[0]
+		wakeFor := event.At
+		if event.Deadline > 0 {
+			wakeFor = event.At - t.Profile.WakeDuration
+		}
+		if wakeFor < target {
+			target = wakeFor
+		}
+	}
+	if target < t.Now {
+		target = t.Now
+	}
+	return target
+}
+
+func (t *Timeline) hasDueUrgentEvent() bool {
+	for _, event := range t.Events {
+		if event.At <= t.Now && event.Urgent {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Timeline) nextEventAt() (time.Duration, bool) {
 	if len(t.Events) == 0 {
 		return 0, false
@@ -292,6 +434,17 @@ func (t *Timeline) beginWake() error {
 	reasons := make([]string, 0, len(due))
 	for _, event := range due {
 		reasons = append(reasons, event.Reason)
+	}
+	if len(reasons) == 0 {
+		// An early wake for deadline work names the event it wakes for.
+		if len(t.Events) > 0 && t.Events[0].At <= t.Now+t.Profile.WakeDuration {
+			groupTime := t.Events[0].At
+			for _, event := range t.Events {
+				if event.At == groupTime {
+					reasons = append(reasons, event.Reason)
+				}
+			}
+		}
 	}
 	if len(reasons) == 0 {
 		reasons = append(reasons, "scheduled-wakeup")
@@ -393,6 +546,22 @@ func (t *Timeline) processDueEvents() error {
 		Duration:    duration,
 		EnergyNanos: t.EnergyNanos - before,
 	})
+	completion := t.Now
+	for _, event := range group {
+		if event.Deadline <= 0 {
+			continue
+		}
+		if completion <= event.Deadline {
+			t.CompletedOnTime = append(t.CompletedOnTime, event.Reason)
+			continue
+		}
+		t.MissedDeadlines = append(t.MissedDeadlines, event.Reason)
+		t.Records = append(t.Records, Record{
+			At:     completion,
+			Kind:   "deadline-missed",
+			Detail: event.Reason,
+		})
+	}
 	for name, shouldPowerOff := range powerOff {
 		if shouldPowerOff {
 			peripheral := t.Peripherals[name]
@@ -434,6 +603,10 @@ func (t *Timeline) advance(duration time.Duration) {
 		t.SleepDuration += duration
 	case CPUWaking:
 		t.WakeDuration += duration
+	case CPUSleeping:
+		// Still fully powered while the entry drains.
+		cpuEnergyPerMillisecond = t.Profile.ActiveEnergyPerMillisecond
+		t.SleepEntryDuration += duration
 	}
 
 	peripheralEnergy := 0.0
@@ -451,7 +624,7 @@ func (t *Timeline) advance(duration time.Duration) {
 	}
 
 	energy := cpuEnergyPerMillisecond*float64(duration)/float64(time.Millisecond) + peripheralEnergy
-	if supply := t.Profile.SupplyEnergyPerMillisecond; supply > 0 {
+	if supply := t.supplyCap(); supply > 0 {
 		rate := energy * float64(time.Millisecond) / float64(duration)
 		if rate > supply {
 			stretched := time.Duration(float64(duration) * rate / supply)
@@ -463,6 +636,14 @@ func (t *Timeline) advance(duration time.Duration) {
 
 	t.Now += duration
 	t.EnergyNanos += energy
+}
+
+// supplyCap returns the current supply limit, accounting for recovery.
+func (t *Timeline) supplyCap() float64 {
+	if t.Profile.SupplyRecoveryAt > 0 && t.Now >= t.Profile.SupplyRecoveryAt {
+		return t.Profile.RecoveredSupplyEnergyPerMillisecond
+	}
+	return t.Profile.SupplyEnergyPerMillisecond
 }
 
 func (t *Timeline) SaveSnapshot() ([]byte, error) {

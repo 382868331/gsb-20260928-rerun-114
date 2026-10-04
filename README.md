@@ -21,6 +21,15 @@
   方便对账工作量、等待与能量。
 - 唤醒是分段推进的：快照可以保存在 waking 途中，恢复后接着走完剩余的
   唤醒过程，不会直接跳成已唤醒。
+- 进入休眠同样是分段推进的（\`SleepEntryDuration\`）：快照可保存在进入途中，
+  恢复后接着走完剩余过程，尚未结束的耗能和待处理事件在重开后继续。
+- 事件可带 \`Deadline\`：设备按唤醒延迟提前唤醒以赶上时限，处理完成后
+  分别记入 \`CompletedOnTime\` 与 \`MissedDeadlines\`，明确哪些请求完成、
+  哪些错过时限。
+- 带 \`Urgent\` 的事件会打断休眠进入：已消耗的能量不退回，待关机清单被
+  丢弃，与事件无关的独立电源域保持关闭，不被无条件唤醒。
+- \`SupplyRecoveryAt\` 表示供能恢复时刻：恢复前按 \`SupplyEnergyPerMillisecond\`
+  限流拉长，恢复后按 \`RecoveredSupplyEnergyPerMillisecond\`（0 为不限）。
 
 ## 核对场景
 
