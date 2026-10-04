@@ -21,6 +21,16 @@
   方便对账工作量、等待与能量。
 - 唤醒是分段推进的：快照可以保存在 waking 途中，恢复后接着走完剩余的
   唤醒过程，不会直接跳成已唤醒。
+- 进入休眠同样是分段推进的：设置 `SleepEntryDuration` 后 `SleepUntil` 先进入
+  `falling-asleep` 过渡态，能耗按 `SleepEntryEnergyNanos` 渐进计入，快照可以
+  保存在过渡途中，恢复后接着走完剩余过渡再真正休眠；过渡完成前外设和域
+  保持供电。
+- 事件可带 `Deadline`（绝对截止时间）和 `Urgent`：设备按当前状态估算完成
+  时刻（含剩余唤醒/过渡时间和欠压拉长），赶不上截止时间的请求记入
+  `MissedEvents`，不会为了它提前唤醒；赶得上才会提前唤醒并完成。唤醒只
+  拉起请求所需的依赖链，无关电源域保持关闭。
+- 紧急（`Urgent`）工作会打断进入休眠的过渡：过渡中止、设备保持供电，
+  但已经消耗的过渡能耗不退回，记录为 `sleep-entry-aborted`。
 
 ## 核对场景
 
@@ -46,3 +56,10 @@ analog 域会被阻断（输出 `blocked:` 行），独立的 io 域照常关闭
 3000nJ/ms 低于活跃功耗，时间被拉长并计入 `wait`。
 
 增加设备类型时，只需创建外设实例或事件类型并挂到同一时间线，不需要改变时间推进、快照和能耗累计逻辑。
+
+`main.go` 还包含带截止时间的时间线：进入休眠 2ms 过渡、供能上限
+1000nJ/ms 下 4ms 工作被拉长到 8ms，`stretched-sample` 恰好赶上截止，
+`starved-burst` 错过时限且不唤醒设备，供能恢复后 `recovered-sample`
+完成；完成量、错过量与能量账目由 `TestDeadlinesRespectSupplyRecovery`
+核对，连续推进与快照恢复推进由 `TestContinuousAndRestoredRunsMatch`
+核对为同一决定。

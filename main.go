@@ -23,6 +23,61 @@ func main() {
 		domains.EnergyNanos/1000,
 	)
 	fmt.Printf("[domains] recoveries=%d reasons=%v\n", domains.RecoveryCount, domains.WakeReasons)
+
+	deadlines := buildDeadlineScenario()
+	fmt.Printf("[deadlines] time=%s wait=%s energy=%.3fuJ\n",
+		deadlines.Now,
+		deadlines.WaitDuration,
+		deadlines.EnergyNanos/1000,
+	)
+	fmt.Printf("[deadlines] completed=%v missed=%v recoveries=%d\n",
+		deadlines.CompletedEvents,
+		deadlines.MissedEvents,
+		deadlines.RecoveryCount,
+	)
+}
+
+// buildDeadlineScenario 演示带截止时间的工作请求：进入休眠有 2ms 过渡，
+// 供能上限 1000nJ/ms 会把活跃工作拉长；赶不上截止时间的请求记为错过，
+// 不会唤醒设备；供能恢复后同样的请求可以完成。
+func buildDeadlineScenario() *Timeline {
+	timeline := NewTimeline(PowerProfile{
+		ActiveEnergyPerMillisecond: 2_000,
+		SleepEnergyPerMillisecond:  100,
+		WakeDuration:               2 * time.Millisecond,
+		WakeEnergyNanos:            12_000,
+		SleepEntryDuration:         2 * time.Millisecond,
+		SleepEntryEnergyNanos:      6_000,
+		SupplyEnergyPerMillisecond: 1_000,
+	})
+	events := []Event{
+		{At: 10 * time.Millisecond, Type: EventSample, Reason: "stretched-sample", CPUWork: 4 * time.Millisecond, Deadline: 20 * time.Millisecond},
+		{At: 30 * time.Millisecond, Type: EventBurst, Reason: "starved-burst", CPUWork: 4 * time.Millisecond, Deadline: 34 * time.Millisecond},
+		{At: 40 * time.Millisecond, Type: EventSample, Reason: "recovered-sample", CPUWork: 4 * time.Millisecond, Deadline: 46 * time.Millisecond},
+	}
+	for _, event := range events {
+		if err := timeline.Schedule(event); err != nil {
+			panic(err)
+		}
+	}
+	if err := timeline.SleepUntil(10 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	if err := timeline.RunUntil(22 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	if err := timeline.SleepUntil(50 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	if err := timeline.RunUntil(34 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	// 供能恢复，后续请求不再被拉长。
+	timeline.Profile.SupplyEnergyPerMillisecond = 0
+	if err := timeline.RunUntil(50 * time.Millisecond); err != nil {
+		panic(err)
+	}
+	return timeline
 }
 
 func buildScenario() *Timeline {
