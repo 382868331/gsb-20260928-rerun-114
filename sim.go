@@ -92,35 +92,44 @@ type Record struct {
 }
 
 type Timeline struct {
-	Now                 time.Duration           `json:"now"`
-	EnergyNanos         float64                 `json:"energyNanos"`
-	CPUState            CPUState                `json:"cpuState"`
-	WakeAt              time.Duration           `json:"wakeAt"`
-	Profile             PowerProfile            `json:"profile"`
-	Peripherals         map[string]*Peripheral  `json:"peripherals"`
-	Events              []Event                 `json:"events"`
-	Records             []Record                `json:"records"`
-	ActiveDuration      time.Duration           `json:"activeDuration"`
-	SleepDuration       time.Duration           `json:"sleepDuration"`
-	WakeDuration        time.Duration           `json:"wakeDurationTotal"`
-	CPUWork             time.Duration           `json:"cpuWork"`
-	TransferDuration    time.Duration           `json:"transferDuration"`
-	WaitDuration        time.Duration           `json:"waitDuration"`
-	CompletedEvents     map[string]int          `json:"completedEvents"`
-	WakeReasons         []string                `json:"wakeReasons"`
-	RecoveryCount       int                     `json:"recoveryCount"`
-	Domains             map[string]*PowerDomain `json:"domains,omitempty"`
-	WakeRemaining       time.Duration           `json:"wakeRemaining,omitempty"`
-	WakeStartAt         time.Duration           `json:"wakeStartAt,omitempty"`
-	WakePendingReasons  []string                `json:"wakePendingReasons,omitempty"`
-	SleepRemaining      time.Duration           `json:"sleepRemaining,omitempty"`
-	SleepStartAt        time.Duration           `json:"sleepStartAt,omitempty"`
-	SleepPendingWakeAt  time.Duration           `json:"sleepPendingWakeAt,omitempty"`
-	SleepPendingOff     []string                `json:"sleepPendingOff,omitempty"`
-	SleepPendingDomains []string                `json:"sleepPendingDomains,omitempty"`
-	SleepEntryDuration  time.Duration           `json:"sleepEntryDurationTotal,omitempty"`
-	CompletedOnTime     []string                `json:"completedOnTime,omitempty"`
-	MissedDeadlines     []string                `json:"missedDeadlines,omitempty"`
+	Now                time.Duration           `json:"now"`
+	EnergyNanos        float64                 `json:"energyNanos"`
+	CPUState           CPUState                `json:"cpuState"`
+	WakeAt             time.Duration           `json:"wakeAt"`
+	Profile            PowerProfile            `json:"profile"`
+	Peripherals        map[string]*Peripheral  `json:"peripherals"`
+	Events             []Event                 `json:"events"`
+	Records            []Record                `json:"records"`
+	ActiveDuration     time.Duration           `json:"activeDuration"`
+	SleepDuration      time.Duration           `json:"sleepDuration"`
+	WakeDuration       time.Duration           `json:"wakeDurationTotal"`
+	CPUWork            time.Duration           `json:"cpuWork"`
+	TransferDuration   time.Duration           `json:"transferDuration"`
+	WaitDuration       time.Duration           `json:"waitDuration"`
+	CompletedEvents    map[string]int          `json:"completedEvents"`
+	WakeReasons        []string                `json:"wakeReasons"`
+	RecoveryCount      int                     `json:"recoveryCount"`
+	Domains            map[string]*PowerDomain `json:"domains,omitempty"`
+	WakeRemaining      time.Duration           `json:"wakeRemaining,omitempty"`
+	WakeStartAt        time.Duration           `json:"wakeStartAt,omitempty"`
+	WakePendingReasons []string                `json:"wakePendingReasons,omitempty"`
+	SleepRemaining     time.Duration           `json:"sleepRemaining,omitempty"`
+	SleepStartAt       time.Duration           `json:"sleepStartAt,omitempty"`
+	// SleepEntryEnergyCharged is the transition energy already accrued for
+	// the in-progress sleep entry, proportional to how far it advanced.
+	// It survives snapshots so a resumed entry never double-charges and an
+	// aborted entry never refunds it.
+	SleepEntryEnergyCharged float64       `json:"sleepEntryEnergyCharged,omitempty"`
+	SleepPendingWakeAt      time.Duration `json:"sleepPendingWakeAt,omitempty"`
+	SleepPendingOff         []string      `json:"sleepPendingOff,omitempty"`
+	SleepPendingDomains     []string      `json:"sleepPendingDomains,omitempty"`
+	SleepEntryDuration      time.Duration `json:"sleepEntryDurationTotal,omitempty"`
+	// WakePendingEnergy is the energy the current wake charges when it
+	// completes; a wake from an aborted sleep entry is scaled by how deep
+	// the entry had progressed instead of paying the full cost.
+	WakePendingEnergy float64  `json:"wakePendingEnergy,omitempty"`
+	CompletedOnTime   []string `json:"completedOnTime,omitempty"`
+	MissedDeadlines   []string `json:"missedDeadlines,omitempty"`
 }
 
 func NewTimeline(profile PowerProfile) *Timeline {
@@ -279,7 +288,14 @@ func (t *Timeline) finishSleepEntry() {
 		domainsOff[name] = true
 	}
 	t.powerOffAll(shutdown, domainsOff)
-	t.EnergyNanos += t.Profile.SleepEntryEnergyNanos
+	// Most of the entry cost was already accrued step by step; only the
+	// rounding remainder is left, so a resumed entry never double-charges.
+	remainder := t.Profile.SleepEntryEnergyNanos - t.SleepEntryEnergyCharged
+	if remainder < 0 {
+		remainder = 0
+	}
+	t.EnergyNanos += remainder
+	t.SleepEntryEnergyCharged = 0
 	t.Records = append(t.Records, Record{
 		At:          t.SleepStartAt,
 		Kind:        "sleep-entry",
@@ -294,17 +310,27 @@ func (t *Timeline) finishSleepEntry() {
 // abortSleepEntry cancels an in-progress entry for urgent work. Energy
 // already spent is not refunded and the pending shutdown is discarded;
 // domains that were already off stay off.
-func (t *Timeline) abortSleepEntry() {
+// It returns how far the entry had progressed as a fraction of the full
+// transition, so the caller can scale the wake-back cost instead of
+// paying for a complete wake from deep sleep.
+func (t *Timeline) abortSleepEntry() float64 {
+	progress := 0.0
+	if total := t.Profile.SleepEntryDuration; total > 0 {
+		progress = float64(total-t.SleepRemaining) / float64(total)
+	}
 	t.Records = append(t.Records, Record{
-		At:       t.Now,
-		Kind:     "sleep-entry-aborted",
-		Duration: t.Now - t.SleepStartAt,
-		Detail:   "urgent work interrupted the sleep entry",
+		At:          t.Now,
+		Kind:        "sleep-entry-aborted",
+		Duration:    t.Now - t.SleepStartAt,
+		EnergyNanos: t.SleepEntryEnergyCharged,
+		Detail:      "urgent work interrupted the sleep entry",
 	})
 	t.SleepRemaining = 0
+	t.SleepEntryEnergyCharged = 0
 	t.SleepPendingOff = nil
 	t.SleepPendingDomains = nil
 	t.CPUState = CPUActive
+	return progress
 }
 
 func (t *Timeline) RunUntil(horizon time.Duration) error {
@@ -325,9 +351,19 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 			continue
 		case CPUSleeping:
 			if t.hasDueUrgentEvent() {
-				t.abortSleepEntry()
-				if err := t.beginWake(); err != nil {
-					return err
+				progress := t.abortSleepEntry()
+				// The processor never reached sleep, so waking back up is
+				// scaled by how deep the entry had gone; an entry that had
+				// not started needs no wake at all.
+				if progress > 0 {
+					if err := t.beginWake(); err != nil {
+						return err
+					}
+					t.WakeRemaining = time.Duration(progress * float64(t.Profile.WakeDuration))
+					t.WakePendingEnergy = progress * t.Profile.WakeEnergyNanos
+					if t.WakeRemaining == 0 {
+						t.finishWake()
+					}
 				}
 				continue
 			}
@@ -341,6 +377,13 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 			}
 			t.advance(step)
 			t.SleepRemaining -= step
+			// Accrue the transition energy with the actual progress so an
+			// interrupt or snapshot keeps what was spent without refund or
+			// double counting.
+			if total := t.Profile.SleepEntryDuration; total > 0 {
+				t.SleepEntryEnergyCharged += t.Profile.SleepEntryEnergyNanos * float64(step) / float64(total)
+				t.EnergyNanos += t.Profile.SleepEntryEnergyNanos * float64(step) / float64(total)
+			}
 			if t.SleepRemaining == 0 {
 				t.finishSleepEntry()
 			}
@@ -454,20 +497,26 @@ func (t *Timeline) beginWake() error {
 	t.WakeRemaining = t.Profile.WakeDuration
 	t.WakeStartAt = t.Now
 	t.WakePendingReasons = reasons
+	t.WakePendingEnergy = t.Profile.WakeEnergyNanos
 	t.RecoveryCount++
 	t.WakeReasons = append(t.WakeReasons, reasons...)
 	return nil
 }
 
 func (t *Timeline) finishWake() {
-	wakeDuration := t.Profile.WakeDuration
-	t.EnergyNanos += t.Profile.WakeEnergyNanos
+	wakeDuration := t.Now - t.WakeStartAt
+	energy := t.WakePendingEnergy
+	if energy == 0 {
+		energy = t.Profile.WakeEnergyNanos
+	}
+	t.EnergyNanos += energy
+	t.WakePendingEnergy = 0
 	t.Records = append(t.Records, Record{
 		At:          t.WakeStartAt,
 		Kind:        "wake",
 		Reasons:     t.WakePendingReasons,
 		Duration:    wakeDuration,
-		EnergyNanos: t.Profile.WakeEnergyNanos,
+		EnergyNanos: energy,
 	})
 	t.WakePendingReasons = nil
 	t.CPUState = CPUActive

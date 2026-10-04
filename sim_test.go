@@ -440,6 +440,202 @@ func TestSupplyRecoveryTimeline(t *testing.T) {
 	}
 }
 
+// sleepEntryEnergyTimeline 复现题目配置：进入休眠 10ms、过渡总耗能 100nJ。
+func sleepEntryEnergyTimeline() *Timeline {
+	timeline := NewTimeline(PowerProfile{
+		ActiveEnergyPerMillisecond: 2_000,
+		SleepEnergyPerMillisecond:  100,
+		WakeDuration:               4 * time.Millisecond,
+		WakeEnergyNanos:            80,
+		SleepEntryDuration:         10 * time.Millisecond,
+		SleepEntryEnergyNanos:      100,
+	})
+	timeline.AddPeripheral("sensor", 0)
+	return timeline
+}
+
+func sleepEntryTransitionEnergy(timeline *Timeline) float64 {
+	total := 0.0
+	for _, record := range timeline.Records {
+		if record.Kind == "sleep-entry" || record.Kind == "sleep-entry-aborted" {
+			total += record.EnergyNanos
+		}
+	}
+	return total
+}
+
+func TestSleepEntryEnergyAccruesWithProgress(t *testing.T) {
+	// 多个打断位置：5ms（一半）与 3ms 处被紧急工作打断。
+	for _, interruptAt := range []time.Duration{5 * time.Millisecond, 3 * time.Millisecond} {
+		timeline := sleepEntryEnergyTimeline()
+		if err := timeline.Schedule(Event{At: interruptAt, Type: EventBurst, Reason: "urgent", Peripheral: "sensor", CPUWork: time.Millisecond, Urgent: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+			t.Fatal(err)
+		}
+		if err := timeline.RunUntil(50 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		// 已推进的过渡能量按进度入账：10ms/100nJ 的进入在 interruptAt
+		// 处打断，已消耗 interruptAt/10ms*100nJ，不退回也不重复。
+		wantEntry := 100 * float64(interruptAt) / float64(10*time.Millisecond)
+		if got := sleepEntryTransitionEnergy(timeline); math.Abs(got-wantEntry) > 0.001 {
+			t.Fatalf("interrupt at %s: entry energy = %.3f nJ, want %.3f nJ", interruptAt, got, wantEntry)
+		}
+		// 尚未真正睡着：唤醒按进入深度缩放，不支付完整唤醒过程。
+		progress := float64(interruptAt) / float64(10*time.Millisecond)
+		wantWake := progress * 80
+		wakeEnergy := 0.0
+		for _, record := range timeline.Records {
+			if record.Kind == "wake" {
+				wakeEnergy += record.EnergyNanos
+			}
+		}
+		if math.Abs(wakeEnergy-wantWake) > 0.001 {
+			t.Fatalf("interrupt at %s: wake energy = %.3f nJ, want %.3f nJ", interruptAt, wakeEnergy, wantWake)
+		}
+		if timeline.WakeDuration != time.Duration(progress*float64(4*time.Millisecond)) {
+			t.Fatalf("interrupt at %s: wake duration = %s", interruptAt, timeline.WakeDuration)
+		}
+		if timeline.SleepEntryDuration != interruptAt {
+			t.Fatalf("interrupt at %s: entry duration = %s", interruptAt, timeline.SleepEntryDuration)
+		}
+		if timeline.CompletedEvents[string(EventBurst)] != 1 {
+			t.Fatalf("interrupt at %s: urgent event not processed", interruptAt)
+		}
+	}
+}
+
+func TestSleepEntryEnergyConsistentAcrossStepSizes(t *testing.T) {
+	// 不同推进步长：一口气推进、2ms 步进、3ms 步进，累计过渡耗能一致。
+	run := func(steps ...time.Duration) *Timeline {
+		timeline := sleepEntryEnergyTimeline()
+		if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+			t.Fatal(err)
+		}
+		for _, horizon := range steps {
+			if err := timeline.RunUntil(horizon); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return timeline
+	}
+	direct := run(20 * time.Millisecond)
+	by2 := run(2*time.Millisecond, 4*time.Millisecond, 6*time.Millisecond, 8*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond)
+	by3 := run(3*time.Millisecond, 6*time.Millisecond, 9*time.Millisecond, 20*time.Millisecond)
+	for _, other := range []*Timeline{by2, by3} {
+		if math.Abs(other.EnergyNanos-direct.EnergyNanos) > 0.001 {
+			t.Fatalf("energy differs by step size: %.3f vs %.3f", other.EnergyNanos, direct.EnergyNanos)
+		}
+		if other.SleepRemaining != 0 || other.CPUState != CPUSleep {
+			t.Fatalf("entry not finished: state=%s remaining=%s", other.CPUState, other.SleepRemaining)
+		}
+	}
+	// 完整进入后过渡耗能恰好是 100nJ，不多不少。
+	if got := sleepEntryTransitionEnergy(direct); math.Abs(got-100) > 0.001 {
+		t.Fatalf("entry energy = %.3f nJ, want 100 nJ", got)
+	}
+}
+
+func TestSleepEntryEnergySurvivesSnapshotWithoutDoubleCharge(t *testing.T) {
+	// 在进入途中（4ms 处）保存快照，重开后走完剩余过渡。
+	build := func() *Timeline {
+		timeline := sleepEntryEnergyTimeline()
+		if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+			t.Fatal(err)
+		}
+		return timeline
+	}
+	direct := build()
+	if err := direct.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	resumed := build()
+	if err := resumed.RunUntil(4 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.SleepRemaining != 6*time.Millisecond {
+		t.Fatalf("remaining = %s, want 6ms", resumed.SleepRemaining)
+	}
+	data, err := resumed.SaveSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err = LoadSnapshot(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.SleepEntryEnergyCharged != 40 {
+		t.Fatalf("charged before resume = %.3f nJ, want 40 nJ", resumed.SleepEntryEnergyCharged)
+	}
+	if err := resumed.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(resumed.EnergyNanos-direct.EnergyNanos) > 0.001 {
+		t.Fatalf("resumed=%.3f direct=%.3f", resumed.EnergyNanos, direct.EnergyNanos)
+	}
+	if got := sleepEntryTransitionEnergy(resumed); math.Abs(got-100) > 0.001 {
+		t.Fatalf("resumed entry energy = %.3f nJ, want 100 nJ (no double charge)", got)
+	}
+}
+
+func TestAbortedSleepEntryEnergyNotRechargedOnNextEntry(t *testing.T) {
+	// 打断后再次进入休眠：新一次进入独立累计，不把上次已耗能退回或重复。
+	timeline := sleepEntryEnergyTimeline()
+	if err := timeline.Schedule(Event{At: 5 * time.Millisecond, Type: EventBurst, Reason: "urgent", Peripheral: "sensor", CPUWork: time.Millisecond, Urgent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	energyAfterAbort := timeline.EnergyNanos
+	if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(60 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// 第一次进入推进 5ms 记 50nJ，第二次完整进入记 100nJ，合计 150nJ。
+	if got := sleepEntryTransitionEnergy(timeline); math.Abs(got-150) > 0.001 {
+		t.Fatalf("total entry energy = %.3f nJ, want 150 nJ", got)
+	}
+	if timeline.EnergyNanos <= energyAfterAbort {
+		t.Fatal("second entry made no progress")
+	}
+	if timeline.CPUState != CPUSleep {
+		t.Fatalf("state = %s, want sleep", timeline.CPUState)
+	}
+}
+
+func TestUrgentInterruptDeadlineAccounting(t *testing.T) {
+	// 打断位置影响唤醒完成时刻，从而影响截止时间核对。
+	timeline := sleepEntryEnergyTimeline()
+	if err := timeline.Schedule(Event{At: 5 * time.Millisecond, Type: EventBurst, Reason: "urgent-deadline", Peripheral: "sensor", CPUWork: 2 * time.Millisecond, Urgent: true, Deadline: 9 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.SleepUntil(100*time.Millisecond, "sensor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(30 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// 进入推进 5ms/10ms，唤醒缩放为 2ms：5ms 打断，7ms 活跃，9ms 完成，
+	// 正好赶上 9ms 的截止时间。
+	if len(timeline.MissedDeadlines) != 0 {
+		t.Fatalf("missed = %v", timeline.MissedDeadlines)
+	}
+	if len(timeline.CompletedOnTime) != 1 || timeline.CompletedOnTime[0] != "urgent-deadline" {
+		t.Fatalf("on-time = %v", timeline.CompletedOnTime)
+	}
+	if timeline.WakeDuration != 2*time.Millisecond {
+		t.Fatalf("wake duration = %s, want 2ms", timeline.WakeDuration)
+	}
+}
+
 func TestContinuousAndResumedRunsAgree(t *testing.T) {
 	build := func() *Timeline {
 		timeline := sleepEntryTimeline()
