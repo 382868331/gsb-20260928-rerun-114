@@ -489,3 +489,125 @@ func TestContinuousAndResumedRunsAgree(t *testing.T) {
 		t.Fatalf("on-time=%v missed=%v", direct.CompletedOnTime, direct.MissedDeadlines)
 	}
 }
+
+// 休眠进入 10ms、总过渡耗能 100nJ：按实际推进量累积，紧急打断后
+// 已消耗部分不退回，唤醒也只按进入进度比例支付。
+func TestSleepEntryInterruptionEnergyAccounting(t *testing.T) {
+	const (
+		entryDuration = 10 * time.Millisecond
+		entryEnergy   = 100.0
+		wakeDuration  = 4 * time.Millisecond
+		wakeEnergy    = 40.0
+		horizon       = 30 * time.Millisecond
+	)
+	build := func(interruptAt time.Duration) *Timeline {
+		timeline := NewTimeline(PowerProfile{
+			WakeDuration:          wakeDuration,
+			WakeEnergyNanos:       wakeEnergy,
+			SleepEntryDuration:    entryDuration,
+			SleepEntryEnergyNanos: entryEnergy,
+		})
+		progress := float64(interruptAt) / float64(entryDuration)
+		scaledWake := time.Duration(progress * float64(wakeDuration))
+		if err := timeline.Schedule(Event{
+			At:       interruptAt,
+			Type:     EventBurst,
+			Reason:   "urgent",
+			CPUWork:  time.Millisecond,
+			Urgent:   true,
+			Deadline: interruptAt + scaledWake + time.Millisecond,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := timeline.SleepUntil(100 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		return timeline
+	}
+
+	for _, interruptAt := range []time.Duration{2 * time.Millisecond, 5 * time.Millisecond, 8 * time.Millisecond} {
+		progress := float64(interruptAt) / float64(entryDuration)
+		wantEnergy := progress*entryEnergy + progress*wakeEnergy
+		wantWake := time.Duration(progress * float64(wakeDuration))
+
+		// 不同推进步长（1ms、3ms、一次性）账目必须一致。
+		for _, step := range []time.Duration{time.Millisecond, 3 * time.Millisecond, horizon} {
+			timeline := build(interruptAt)
+			for now := time.Duration(0); now < horizon; now += step {
+				end := now + step
+				if end > horizon {
+					end = horizon
+				}
+				if err := timeline.RunUntil(end); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if math.Abs(timeline.EnergyNanos-wantEnergy) > 0.001 {
+				t.Fatalf("interrupt=%s step=%s energy=%.3f want %.3f",
+					interruptAt, step, timeline.EnergyNanos, wantEnergy)
+			}
+			if timeline.WakeDuration != wantWake {
+				t.Fatalf("interrupt=%s step=%s wake=%s want %s",
+					interruptAt, step, timeline.WakeDuration, wantWake)
+			}
+			if timeline.SleepEntryDuration != interruptAt {
+				t.Fatalf("interrupt=%s step=%s entry progress=%s want %s",
+					interruptAt, step, timeline.SleepEntryDuration, interruptAt)
+			}
+			if len(timeline.CompletedOnTime) != 1 || timeline.CompletedOnTime[0] != "urgent" {
+				t.Fatalf("interrupt=%s step=%s on-time=%v missed=%v",
+					interruptAt, step, timeline.CompletedOnTime, timeline.MissedDeadlines)
+			}
+		}
+
+		// 进入途中保存快照：剩余过渡不少算，恢复后也不重复计算。
+		snapshotAt := interruptAt - time.Millisecond
+		resumed := build(interruptAt)
+		if err := resumed.RunUntil(snapshotAt); err != nil {
+			t.Fatal(err)
+		}
+		if resumed.CPUState != CPUSleeping || resumed.SleepRemaining != entryDuration-snapshotAt {
+			t.Fatalf("interrupt=%s state=%s remaining=%s", interruptAt, resumed.CPUState, resumed.SleepRemaining)
+		}
+		data, err := resumed.SaveSnapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, err = LoadSnapshot(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resumed.RunUntil(horizon); err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(resumed.EnergyNanos-wantEnergy) > 0.001 {
+			t.Fatalf("interrupt=%s resumed energy=%.3f want %.3f", interruptAt, resumed.EnergyNanos, wantEnergy)
+		}
+		if resumed.Now != horizon || resumed.WakeDuration != wantWake {
+			t.Fatalf("interrupt=%s resumed now=%s wake=%s", interruptAt, resumed.Now, resumed.WakeDuration)
+		}
+	}
+}
+
+// 完整走完的进入过程恰好收取一次总过渡耗能，不多不少。
+func TestSleepEntryCompletionChargesExactlyOnce(t *testing.T) {
+	timeline := NewTimeline(PowerProfile{
+		SleepEntryDuration:    10 * time.Millisecond,
+		SleepEntryEnergyNanos: 100,
+	})
+	if err := timeline.SleepUntil(50 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.RunUntil(20 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if timeline.CPUState != CPUSleep {
+		t.Fatalf("state = %s, want sleep", timeline.CPUState)
+	}
+	if math.Abs(timeline.EnergyNanos-100) > 0.001 {
+		t.Fatalf("energy = %.3f nJ, want 100 nJ", timeline.EnergyNanos)
+	}
+	if timeline.SleepEntryDuration != 10*time.Millisecond || timeline.SleepRemaining != 0 {
+		t.Fatalf("entry=%s remaining=%s", timeline.SleepEntryDuration, timeline.SleepRemaining)
+	}
+}

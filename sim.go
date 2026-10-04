@@ -43,8 +43,10 @@ type PowerProfile struct {
 	SupplyRecoveryAt                    time.Duration `json:"supplyRecoveryAt,omitempty"`
 	RecoveredSupplyEnergyPerMillisecond float64       `json:"recoveredSupplyEnergyPerMillisecond,omitempty"`
 	// SleepEntryDuration models a non-instantaneous transition into sleep.
-	// SleepEntryEnergyNanos is charged once the entry completes; an aborted
-	// entry keeps the energy already spent but skips this charge.
+	// SleepEntryEnergyNanos is the total transition cost, accumulated
+	// proportionally to progress: an aborted entry keeps the share already
+	// spent (no refund, no double charge on resume), and a completed entry
+	// has charged exactly the full amount.
 	SleepEntryDuration    time.Duration `json:"sleepEntryDuration,omitempty"`
 	SleepEntryEnergyNanos float64       `json:"sleepEntryEnergyNanos,omitempty"`
 }
@@ -113,6 +115,7 @@ type Timeline struct {
 	WakeRemaining       time.Duration           `json:"wakeRemaining,omitempty"`
 	WakeStartAt         time.Duration           `json:"wakeStartAt,omitempty"`
 	WakePendingReasons  []string                `json:"wakePendingReasons,omitempty"`
+	WakePendingEnergy   float64                 `json:"wakePendingEnergy,omitempty"`
 	SleepRemaining      time.Duration           `json:"sleepRemaining,omitempty"`
 	SleepStartAt        time.Duration           `json:"sleepStartAt,omitempty"`
 	SleepPendingWakeAt  time.Duration           `json:"sleepPendingWakeAt,omitempty"`
@@ -279,7 +282,6 @@ func (t *Timeline) finishSleepEntry() {
 		domainsOff[name] = true
 	}
 	t.powerOffAll(shutdown, domainsOff)
-	t.EnergyNanos += t.Profile.SleepEntryEnergyNanos
 	t.Records = append(t.Records, Record{
 		At:          t.SleepStartAt,
 		Kind:        "sleep-entry",
@@ -293,8 +295,14 @@ func (t *Timeline) finishSleepEntry() {
 
 // abortSleepEntry cancels an in-progress entry for urgent work. Energy
 // already spent is not refunded and the pending shutdown is discarded;
-// domains that were already off stay off.
-func (t *Timeline) abortSleepEntry() {
+// domains that were already off stay off. It returns the entry progress
+// as a fraction in [0,1] so the wake back only pays for how far the
+// processor actually sank toward sleep.
+func (t *Timeline) abortSleepEntry() float64 {
+	progress := 1.0
+	if total := t.Profile.SleepEntryDuration; total > 0 {
+		progress = float64(total-t.SleepRemaining) / float64(total)
+	}
 	t.Records = append(t.Records, Record{
 		At:       t.Now,
 		Kind:     "sleep-entry-aborted",
@@ -305,6 +313,7 @@ func (t *Timeline) abortSleepEntry() {
 	t.SleepPendingOff = nil
 	t.SleepPendingDomains = nil
 	t.CPUState = CPUActive
+	return progress
 }
 
 func (t *Timeline) RunUntil(horizon time.Duration) error {
@@ -325,10 +334,14 @@ func (t *Timeline) RunUntil(horizon time.Duration) error {
 			continue
 		case CPUSleeping:
 			if t.hasDueUrgentEvent() {
-				t.abortSleepEntry()
+				progress := t.abortSleepEntry()
 				if err := t.beginWake(); err != nil {
 					return err
 				}
+				// 尚未真正睡着：唤醒只按进入进度比例支付，
+				// 不无条件收取完整唤醒过程。
+				t.WakeRemaining = time.Duration(progress * float64(t.Profile.WakeDuration))
+				t.WakePendingEnergy = progress * t.Profile.WakeEnergyNanos
 				continue
 			}
 			step := t.SleepRemaining
@@ -454,22 +467,24 @@ func (t *Timeline) beginWake() error {
 	t.WakeRemaining = t.Profile.WakeDuration
 	t.WakeStartAt = t.Now
 	t.WakePendingReasons = reasons
+	t.WakePendingEnergy = t.Profile.WakeEnergyNanos
 	t.RecoveryCount++
 	t.WakeReasons = append(t.WakeReasons, reasons...)
 	return nil
 }
 
 func (t *Timeline) finishWake() {
-	wakeDuration := t.Profile.WakeDuration
-	t.EnergyNanos += t.Profile.WakeEnergyNanos
+	wakeDuration := t.Now - t.WakeStartAt
+	t.EnergyNanos += t.WakePendingEnergy
 	t.Records = append(t.Records, Record{
 		At:          t.WakeStartAt,
 		Kind:        "wake",
 		Reasons:     t.WakePendingReasons,
 		Duration:    wakeDuration,
-		EnergyNanos: t.Profile.WakeEnergyNanos,
+		EnergyNanos: t.WakePendingEnergy,
 	})
 	t.WakePendingReasons = nil
+	t.WakePendingEnergy = 0
 	t.CPUState = CPUActive
 }
 
@@ -624,6 +639,11 @@ func (t *Timeline) advance(duration time.Duration) {
 	}
 
 	energy := cpuEnergyPerMillisecond*float64(duration)/float64(time.Millisecond) + peripheralEnergy
+	if t.CPUState == CPUSleeping && t.Profile.SleepEntryDuration > 0 {
+		// 过渡耗能按实际推进量累积：中途打断已消耗部分不退回，
+		// 快照重开后只继续支付剩余部分，不重复计算。
+		energy += t.Profile.SleepEntryEnergyNanos * float64(duration) / float64(t.Profile.SleepEntryDuration)
+	}
 	if supply := t.supplyCap(); supply > 0 {
 		rate := energy * float64(time.Millisecond) / float64(duration)
 		if rate > supply {
@@ -663,6 +683,11 @@ func LoadSnapshot(data []byte) (*Timeline, error) {
 	}
 	if timeline.CompletedEvents == nil {
 		timeline.CompletedEvents = make(map[string]int)
+	}
+	// Snapshots written before wake energy was tracked per-transition
+	// resume with the full profile charge.
+	if timeline.CPUState == CPUWaking && timeline.WakePendingEnergy == 0 {
+		timeline.WakePendingEnergy = timeline.Profile.WakeEnergyNanos
 	}
 	return timeline, nil
 }
