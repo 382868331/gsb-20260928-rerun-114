@@ -31,6 +31,39 @@ func main() {
 		deadlines.MissedDeadlines,
 		deadlines.EnergyNanos/1000,
 	)
+
+	fmt.Print(buildDenseStudy().Report())
+	fmt.Print(buildIdleUrgentStudy().Report())
+}
+
+// buildDenseStudy 用短间隔密集任务比较入睡等待门槛：
+// 每次空闲即睡要反复支付过渡能耗，等待 6ms 门槛的方案保持活跃反而更省。
+func buildDenseStudy() *Study {
+	study := NewStudy("短间隔密集任务", denseRecord())
+	if _, err := study.Run(studyPlan("每次空闲即睡", 0, WakeEager), 40*time.Millisecond); err != nil {
+		panic(err)
+	}
+	if _, err := study.Run(studyPlan("等待6ms再睡", 6*time.Millisecond, WakeEager), 40*time.Millisecond); err != nil {
+		panic(err)
+	}
+	return study
+}
+
+// buildIdleUrgentStudy 用长空闲后紧急任务比较唤醒策略：
+// 提前唤醒赶上 32ms 截止时间，到达才唤醒则错过；基线结果保留原任务依据。
+func buildIdleUrgentStudy() *Study {
+	study := NewStudy("长空闲后紧急任务", idleRecord())
+	horizon := 60 * time.Millisecond
+	if _, err := study.Run(studyPlan("提前唤醒-基线", 0, WakeEager), horizon); err != nil {
+		panic(err)
+	}
+	if _, err := study.Run(studyPlan("提前唤醒", 0, WakeEager), horizon, urgentBurst()); err != nil {
+		panic(err)
+	}
+	if _, err := study.Run(studyPlan("到达才唤醒", 0, WakeLazy), horizon, urgentBurst()); err != nil {
+		panic(err)
+	}
+	return study
 }
 
 // buildDeadlineScenario 演示休眠进入过程与带截止时间的工作请求：

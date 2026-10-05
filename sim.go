@@ -124,6 +124,10 @@ type Timeline struct {
 	SleepEntryDuration  time.Duration           `json:"sleepEntryDurationTotal,omitempty"`
 	CompletedOnTime     []string                `json:"completedOnTime,omitempty"`
 	MissedDeadlines     []string                `json:"missedDeadlines,omitempty"`
+	// DeadlineWakeLead, when set, replaces Profile.WakeDuration as the lead
+	// time for waking ahead of deadline work. Lazy wake strategies set it to
+	// zero so the processor only wakes when the event actually arrives.
+	DeadlineWakeLead *time.Duration `json:"deadlineWakeLead,omitempty"`
 }
 
 func NewTimeline(profile PowerProfile) *Timeline {
@@ -304,10 +308,11 @@ func (t *Timeline) abortSleepEntry() float64 {
 		progress = float64(total-t.SleepRemaining) / float64(total)
 	}
 	t.Records = append(t.Records, Record{
-		At:       t.Now,
-		Kind:     "sleep-entry-aborted",
-		Duration: t.Now - t.SleepStartAt,
-		Detail:   "urgent work interrupted the sleep entry",
+		At:          t.Now,
+		Kind:        "sleep-entry-aborted",
+		Duration:    t.Now - t.SleepStartAt,
+		EnergyNanos: progress * t.Profile.SleepEntryEnergyNanos,
+		Detail:      "urgent work interrupted the sleep entry",
 	})
 	t.SleepRemaining = 0
 	t.SleepPendingOff = nil
@@ -405,7 +410,11 @@ func (t *Timeline) sleepWakeTarget() time.Duration {
 		event := t.Events[0]
 		wakeFor := event.At
 		if event.Deadline > 0 {
-			wakeFor = event.At - t.Profile.WakeDuration
+			lead := t.Profile.WakeDuration
+			if t.DeadlineWakeLead != nil {
+				lead = *t.DeadlineWakeLead
+			}
+			wakeFor = event.At - lead
 		}
 		if wakeFor < target {
 			target = wakeFor
