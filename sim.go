@@ -124,6 +124,8 @@ type Timeline struct {
 	SleepEntryDuration  time.Duration           `json:"sleepEntryDurationTotal,omitempty"`
 	CompletedOnTime     []string                `json:"completedOnTime,omitempty"`
 	MissedDeadlines     []string                `json:"missedDeadlines,omitempty"`
+	// LazyWake 为 true 时休眠只在事件到达时唤醒，不为截止时间提前唤醒。
+	LazyWake bool `json:"lazyWake,omitempty"`
 }
 
 func NewTimeline(profile PowerProfile) *Timeline {
@@ -304,10 +306,11 @@ func (t *Timeline) abortSleepEntry() float64 {
 		progress = float64(total-t.SleepRemaining) / float64(total)
 	}
 	t.Records = append(t.Records, Record{
-		At:       t.Now,
-		Kind:     "sleep-entry-aborted",
-		Duration: t.Now - t.SleepStartAt,
-		Detail:   "urgent work interrupted the sleep entry",
+		At:          t.Now,
+		Kind:        "sleep-entry-aborted",
+		Duration:    t.Now - t.SleepStartAt,
+		EnergyNanos: progress * t.Profile.SleepEntryEnergyNanos,
+		Detail:      "urgent work interrupted the sleep entry",
 	})
 	t.SleepRemaining = 0
 	t.SleepPendingOff = nil
@@ -404,7 +407,7 @@ func (t *Timeline) sleepWakeTarget() time.Duration {
 	if len(t.Events) > 0 {
 		event := t.Events[0]
 		wakeFor := event.At
-		if event.Deadline > 0 {
+		if event.Deadline > 0 && !t.LazyWake {
 			wakeFor = event.At - t.Profile.WakeDuration
 		}
 		if wakeFor < target {

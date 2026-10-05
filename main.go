@@ -31,6 +31,33 @@ func main() {
 		deadlines.MissedDeadlines,
 		deadlines.EnergyNanos/1000,
 	)
+
+	runStudyDemos()
+}
+
+// runStudyDemos 用同一份到达任务记录比较不同入睡门槛与唤醒策略。
+func runStudyDemos() {
+	dense := denseStudy()
+	denseResults, err := dense.CompareSchemes(
+		Policy{Name: "eager-sleep", SleepThreshold: 2 * time.Millisecond, Wake: WakeAnticipatory},
+		Policy{Name: "stay-active", SleepThreshold: 10 * time.Millisecond, Wake: WakeAnticipatory},
+	)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[study:dense] 短间隔密集任务（4ms 间隔）")
+	fmt.Print(FormatComparison(denseResults...))
+
+	idle := idleUrgentStudy()
+	idleResults, err := idle.CompareSchemes(
+		Policy{Name: "anticipatory", SleepThreshold: 5 * time.Millisecond, Wake: WakeAnticipatory},
+		Policy{Name: "on-arrival", SleepThreshold: 5 * time.Millisecond, Wake: WakeOnArrival},
+	)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[study:idle-urgent] 长空闲后 80ms 注入紧急任务（截止 83ms）")
+	fmt.Print(FormatComparison(idleResults...))
 }
 
 // buildDeadlineScenario 演示休眠进入过程与带截止时间的工作请求：
